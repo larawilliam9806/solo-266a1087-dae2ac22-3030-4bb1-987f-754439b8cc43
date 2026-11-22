@@ -104,7 +104,10 @@ def db_path() -> str:
 
 
 def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path(), timeout=30)
+    # check_same_thread=False：流式响应的生成器由 Starlette 线程池驱动，
+    # 同一连接可能在不同工作线程中被“依次”使用。任一时刻只有一个线程
+    # 访问该连接（无并发共享），因此关闭线程归属检查是安全的。
+    conn = sqlite3.connect(db_path(), timeout=30, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

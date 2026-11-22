@@ -133,31 +133,109 @@ async function loadRoutes() {
   } catch (e) { sel.innerHTML = "<option>加载失败</option>"; }
 }
 
+// ---------- 时刻查询（分批流式加载） ----------
+let querySeq = 0;        // 查询序号：识别并丢弃旧查询迟到的批次
+let currentAbort = null; // 当前查询的取消器
+
+function tripHtml(t) {
+  return `
+    <div class="trip">
+      <h3>班次 ${t.trip_id}${t.headsign ? " · " + t.headsign : ""} <span class="muted">service: ${t.service_id}</span></h3>
+      <table>
+        <tr><th>序号</th><th>站点</th><th>到站</th><th>发车</th></tr>
+        ${t.stop_times.map(s => `<tr>
+          <td>${s.stop_sequence}</td>
+          <td>${s.stop_name} <span class="muted">${s.stop_id}</span></td>
+          <td>${s.arrival}${s.arrival_day_offset > 0 ? ` <span class="nextday">+${s.arrival_day_offset}天</span>` : ""}</td>
+          <td>${s.departure}${s.departure_day_offset > 0 ? ` <span class="nextday">+${s.departure_day_offset}天</span>` : ""}</td>
+        </tr>`).join("")}
+      </table>
+    </div>`;
+}
+
 $("q-btn").onclick = async () => {
   const route = $("q-route").value, date = $("q-date").value;
   const box = $("q-result");
   if (!route || !date) { box.innerHTML = '<div class="banner err">请选择线路和运营日</div>'; return; }
-  const res = await fetch(`/api/routes/${encodeURIComponent(route)}/schedule?date=${date}`);
-  const data = await res.json();
-  if (!res.ok) { box.innerHTML = `<div class="banner err">${data.detail || "查询失败"}</div>`; return; }
-  if (data.trips.length === 0) {
-    box.innerHTML = '<div class="banner err">该运营日没有班次（线路在此日期无有效服务）</div>';
-    return;
+
+  // 重新查询：取消旧查询（服务端收到断开后停止取下一批），并递增序号——
+  // 旧查询迟到的批次一律丢弃，不会混入新结果；结果区只保留新查询的内容。
+  if (currentAbort) currentAbort.abort();
+  const abort = new AbortController();
+  currentAbort = abort;
+  const seq = ++querySeq;
+
+  box.innerHTML = '<p class="muted" id="q-progress">查询中…</p><div id="q-trips"></div>';
+  const progress = $("q-progress"), tripsBox = $("q-trips");
+  let shown = 0, total = null, metaText = "", finished = false;
+
+  const setProgress = (text, cls) => {
+    if (seq !== querySeq) return; // 旧查询的回调不得触碰新结果区
+    progress.className = cls || "muted";
+    progress.textContent = text;
+  };
+  const progressOf = () =>
+    total == null ? `已显示 ${shown} 个班次` : `已显示 ${shown} / ${total} 个班次`;
+
+  try {
+    const res = await fetch(
+      `/api/routes/${encodeURIComponent(route)}/schedule/stream?date=${date}`,
+      { signal: abort.signal });
+    if (!res.ok) {
+      let msg = "查询失败";
+      try { const d = await res.json(); msg = d.detail || msg; } catch (e) { /* 非 JSON 响应 */ }
+      setProgress("✘ " + msg, "banner err");
+      return;
+    }
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder("utf-8");
+    let buf = "";
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) >= 0) {
+        const line = buf.slice(0, nl).trim();
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        if (seq !== querySeq) return; // 旧查询的迟到批次：丢弃
+        const frame = JSON.parse(line);
+        if (frame.type === "meta") {
+          total = frame.trip_count;
+          metaText = `版本 v${frame.version_id} · ${frame.date}（${frame.weekday}）`;
+          setProgress(total === 0
+            ? `${metaText} · 该运营日没有班次（线路在此日期无有效服务）`
+            : `${metaText} · 共 ${total} 个班次，加载中…`);
+        } else if (frame.type === "batch") {
+          // 每批到达即渲染，无需等待其余班次的停站明细
+          for (const t of frame.trips) tripsBox.insertAdjacentHTML("beforeend", tripHtml(t));
+          shown += frame.trips.length;
+          setProgress(`${metaText} · 共 ${total} 个班次，${progressOf()}…`);
+        } else if (frame.type === "done") {
+          finished = true;
+          setProgress(total === 0
+            ? `${metaText} · 该运营日没有班次（线路在此日期无有效服务）`
+            : `${metaText} · 共 ${total} 个班次 ✔ 全部加载完成`,
+            total === 0 ? "banner err" : "banner ok");
+        } else if (frame.type === "error") {
+          throw new Error(frame.message);
+        }
+      }
+    }
+    if (seq !== querySeq) return;
+    if (!finished && total !== 0) {
+      // 连接中断：保留已显示的班次，提示时刻表未查完
+      setProgress(`⚠ 查询中断，时刻表未查完：${progressOf()}（已显示的班次已保留），请重新查询`,
+                  "banner err");
+    }
+  } catch (e) {
+    if (e.name === "AbortError" || seq !== querySeq) return; // 被新查询取代，无需提示
+    setProgress(`⚠ ${e.message || "查询中断"}，时刻表未查完：${progressOf()}（已显示的班次已保留），请重新查询`,
+                "banner err");
+  } finally {
+    if (seq === querySeq) currentAbort = null;
   }
-  box.innerHTML = `<p class="muted">版本 v${data.version_id} · ${data.date}（${data.weekday}）· 共 ${data.trip_count} 个班次</p>` +
-    data.trips.map(t => `
-      <div class="trip">
-        <h3>班次 ${t.trip_id}${t.headsign ? " · " + t.headsign : ""} <span class="muted">service: ${t.service_id}</span></h3>
-        <table>
-          <tr><th>序号</th><th>站点</th><th>到站</th><th>发车</th></tr>
-          ${t.stop_times.map(s => `<tr>
-            <td>${s.stop_sequence}</td>
-            <td>${s.stop_name} <span class="muted">${s.stop_id}</span></td>
-            <td>${s.arrival}${s.arrival_day_offset > 0 ? ` <span class="nextday">+${s.arrival_day_offset}天</span>` : ""}</td>
-            <td>${s.departure}${s.departure_day_offset > 0 ? ` <span class="nextday">+${s.departure_day_offset}天</span>` : ""}</td>
-          </tr>`).join("")}
-        </table>
-      </div>`).join("");
 };
 
 // ---------- 发布 ----------
